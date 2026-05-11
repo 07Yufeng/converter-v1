@@ -155,6 +155,32 @@ def find_toolpath_start_index(lines):
             return i
     return None
 
+
+
+def find_source_set_g54(lines):
+    set_g54_lines = []
+    for line in lines:
+        code, _ = strip_comment(line)
+        code_clean = strip_block_number(code)
+        if re.search(r"^SET_G54\s*\(", code_clean, re.I):
+            set_g54_lines.append(code_clean)
+    return set_g54_lines[-1] if set_g54_lines else None
+
+def extract_setup_commands(lines):
+    """
+    Extract setup commands from source header for MPF output.
+    Keeps order and de-duplicates consecutive duplicates.
+    """
+    extracted = []
+    for line in lines:
+        code, _ = strip_comment(line)
+        code_clean = strip_block_number(code)
+        converted = convert_setup_command(code_clean)
+        if converted:
+            if not extracted or extracted[-1] != converted:
+                extracted.append(converted)
+    return extracted
+
 def is_power_ramp_motion(code):
     return re.search(r"\bPowerUpLen\b|\bPowerDownLen\b", code, re.I) is not None
 
@@ -199,12 +225,26 @@ def is_ignored_logic_line(code):
     c = strip_block_number(code).strip()
     if not c:
         return True
+
+    # Commands intentionally handled elsewhere or not needed in BEaM MPF body.
+    # Do NOT ignore G71, G54, SET_G54, TC_TRAFO_ON, or TRAFOOF here because
+    # they now have explicit conversion / pass-through rules.
     patterns = [
-        r"^IF\s+IsFirstBlock\s*==\s*1\b", r"^IsFirstBlock\s*=", r"^ENDIF\b",
-        r"^TC_LMD_POWDER\s*\(", r"^TC_LASER_LMD_ON\b", r"^TC_LMD_ON\s*\(", r"^TC_TIMER\s*\(",
-        r"^TC_RESET\b", r"^TC_LMD_FOCUSLINE_DATA\s*\(", r"^TC_LMD_NOZZLE_GAS\s*\(",
-        r"^TC_LASER_REQUEST\s*\(", r"^SET_G54\s*\(", r"^G500\b", r"^G71\b", r"^TC_TRAFO_ON\s*\(",
-        r"^TRAFOOF\b", r"^TOOL_LEN\s*\(", r"^GOTOF\b", r"^G54\b",
+        r"^IF\s+IsFirstBlock\s*==\s*1\b",
+        r"^IsFirstBlock\s*=",
+        r"^ENDIF\b",
+        r"^TC_LMD_POWDER\s*\(",
+        r"^TC_LASER_LMD_ON\b",
+        r"^TC_LASER_LMD_OFF\s*\(",
+        r"^TC_LMD_ON\s*\(",
+        r"^TC_TIMER\s*\(",
+        r"^TC_RESET\b",
+        r"^TC_LMD_FOCUSLINE_DATA\s*\(",
+        r"^TC_LMD_NOZZLE_GAS\s*\(",
+        r"^TC_LASER_REQUEST\s*\(",
+        r"^G500\b",
+        r"^TOOL_LEN\s*\(",
+        r"^GOTOF\b",
     ]
     return any(re.search(p, c, re.I) for p in patterns)
 
@@ -217,9 +257,9 @@ def convert_tc_acl(code):
         return None
     laser = CONFIG["beam"]["laser"]
     if args[0] == "1":
-        return laser["fire_off"], "Laser OFF from TC_ACL(1,...)"
+        return laser["fire_off"]
     if args[0] == "2":
-        return laser["fire_on"], "Laser ON from TC_ACL(2,...)"
+        return laser["fire_on"]
     return None
 
 def is_motion_to_copy(code):
@@ -235,8 +275,50 @@ def is_feed_assignment_to_copy(code):
 def is_label_to_copy(code):
     return re.match(r"^[A-Za-z_]\w*\s*:\s*$", strip_block_number(code)) is not None
 
+def normalize_equals(code):
+    """
+    Normalise motion/address words so X0.201 becomes X=0.201.
+    Existing X=... style is kept unchanged.
+    """
+    c = strip_block_number(code).strip()
+    addresses = ["I1", "J1", "K1", "X", "Y", "Z", "B", "C", "A", "I", "J", "K", "F"]
+    for addr in addresses:
+        c = re.sub(rf"\b{addr}\s+(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
+        c = re.sub(rf"\b{addr}(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
+    return c
+
+
 def clean_motion_or_command(code):
-    return strip_block_number(code).strip()
+    return normalize_equals(code)
+
+def convert_setup_command(code):
+    """
+    Convert/pass through setup commands requested by user:
+    - TC_TRAFO_ON(0) -> TRAORI
+    - TRAFOOF -> TRAFOOF
+    - G71 -> G71
+    - G54 -> G54
+    - SET_G54(...) -> SET_G54(...)
+    - TOOL_LEN(0.0), G500, TC_LASER_REQUEST(1) are ignored elsewhere
+    """
+    c = strip_block_number(code).strip()
+
+    if re.match(r"^TC_TRAFO_ON\s*\(\s*0\s*\)", c, re.I):
+        return "TRAORI"
+
+    if re.match(r"^TRAFOOF\b", c, re.I):
+        return "TRAFOOF"
+
+    if re.match(r"^G71\b", c, re.I):
+        return "G71"
+
+    if re.match(r"^G54\b", c, re.I):
+        return "G54"
+
+    if re.match(r"^SET_G54\s*\(", c, re.I):
+        return c
+
+    return None
 
 def parse_toolpath_lines(lines):
     start = find_toolpath_start_index(lines)
@@ -250,10 +332,26 @@ def parse_toolpath_lines(lines):
         if not stripped:
             continue
         if stripped.startswith(";"):
-            if re.search(r"BLOCK_START|BLOCK_END|Slicer layer|Origin|Start positioning|Slicer", stripped, re.I):
+            if re.search(r"BLOCK_END", stripped, re.I):
+                output.append({"code": None, "comment": stripped.lstrip(";").strip()})
+                output.append({"blank": True})
+            elif re.search(r"BLOCK_START", stripped, re.I):
+                if output and not output[-1].get("blank"):
+                    output.append({"blank": True})
+                output.append({"code": None, "comment": stripped.lstrip(";").strip()})
+            elif re.search(r"Slicer layer|Origin|Start positioning|Slicer", stripped, re.I):
                 output.append({"code": None, "comment": stripped.lstrip(";").strip()})
             continue
         if not code_clean or re.match(r"^N\d+\s*$", code.strip(), re.I):
+            if comment and re.search(r"BLOCK_END", comment, re.I):
+                output.append({"code": None, "comment": comment.strip()})
+                output.append({"blank": True})
+            elif comment and re.search(r"BLOCK_START", comment, re.I):
+                if output and not output[-1].get("blank"):
+                    output.append({"blank": True})
+                output.append({"code": None, "comment": comment.strip()})
+            elif comment and re.search(r"Slicer layer|Origin|Start positioning|Slicer", comment, re.I):
+                output.append({"code": None, "comment": comment.strip()})
             continue
         if is_ignored_logic_line(code_clean):
             report["ignored_logic"] += 1
@@ -261,10 +359,9 @@ def parse_toolpath_lines(lines):
         if re.search(r"\bTC_ACL\s*\(", code_clean, re.I):
             converted = convert_tc_acl(code_clean)
             if converted:
-                cmd, note = converted
-                output.append({"code": cmd, "comment": note})
-                if cmd == CONFIG["beam"]["laser"]["fire_on"]: report["laser_on"] += 1
-                if cmd == CONFIG["beam"]["laser"]["fire_off"]: report["laser_off"] += 1
+                output.append({"code": converted, "comment": None})
+                if converted == CONFIG["beam"]["laser"]["fire_on"]: report["laser_on"] += 1
+                if converted == CONFIG["beam"]["laser"]["fire_off"]: report["laser_off"] += 1
             else:
                 report["ignored_tc_acl_other"] += 1
             continue
@@ -315,6 +412,8 @@ def parse_common(lines, source_name="uploaded.HP", power_head="24vx"):
     parsed["line_count"] = int(vars_.get("LINE_COUNT", evaluate_line_count(parsed["width"], parsed["shift"])))
     parsed["layer_count"] = detect_layer_count(vars_, lines, parsed["layerheight"])
     parsed["laser_off_method"] = detect_laser_off_method(lines)
+    parsed["source_set_g54"] = find_source_set_g54(lines)
+    parsed["setup_commands"] = extract_setup_commands(lines)
     parsed["start_x"], parsed["start_y"], parsed["start_z"] = detect_start_position(lines)
     parsed["puis_laser"] = convert_power_to_puis(parsed["power_w"], parsed["power_head"])
     gas_settings = get_gas_settings(parsed["power_head"])
@@ -329,22 +428,56 @@ def parse_hp_program(hp_path: Path, power_head="24vx"):
     return parse_common(read_text(hp_path).splitlines(), source_name=hp_path.name, power_head=power_head)
 
 def build_hopper_block(bw, parsed):
-    hopper_id, hopper = parsed["hopper"], parsed["hopper_map"]
     bw.section("POWDER FEEDER / HOPPER")
-    bw.add(f"{hopper['sel']}={hopper_id}", f"Hopper {hopper_id} selected")
-    bw.add(f"{hopper['gas']}={parsed['carrier_lpm']:.3f}", "Carrier gas, L/min")
-    bw.add(f"{hopper['stir']}={parsed['stir_pct']}", "Stirrer speed (%)")
-    bw.add(f"{hopper['turn']}={parsed['turn_pct']}", "Turntable speed (%)")
-    bw.add(f"{hopper['on']}", f"Hopper {hopper_id} ON")
+
+    bw.add(comment="HOPPER 1")
+    bw.add(";H21=1                      ;Hopper 1 selected", number=True)
+    bw.add(";H31=20                     ;Channel 1 carrier gas (%) 10% = 1l/min", number=True)
+    bw.add(";H41=0                      ;Channel 1 stirrer speed (%)", number=True)
+    bw.add(";H51=0                      ;Channel 1 turntable speed (%)\n", number=True)
+
+    bw.add(comment="HOPPER 2")
+    bw.add(";H22=2                      ;Hopper 2 selected", number=True)
+    bw.add(";H32=20                     ;Channel 2 carrier gas (%) 10% = 1l/min", number=True)
+    bw.add(";H42=0                      ;Channel 2 stirrer speed (%)", number=True)
+    bw.add(";H52=0                      ;Channel 2 turntable speed (%)\n", number=True)
+
+    bw.add(comment="HOPPER 3")
+    bw.add(" H23=3                        Hopper 3 selected", number=True)
+    bw.add(" H33=20                       Channel 3 carrier gas (%) 10% = 1l/min", number=True)
+    bw.add(" H43=0                        Channel 3 stirrer speed (%)", number=True)
+    bw.add(" H53=0                        Channel 3 turntable speed (%)\n", number=True)
+
+    bw.add(comment="HOPPER 4")
+    bw.add(";H24=4                      ;Hopper 4 selected", number=True)
+    bw.add(";H34=20                     ;Channel 4 carrier gas (%) 10% = 1l/min", number=True)
+    bw.add(";H44=0                      ;Channel 4 stirrer speed (%)", number=True)
+    bw.add(";H54=0                      ;Channel 4 turntable speed (%)\n", number=True)
+
+    bw.add(comment="HOPPER 5")
+    bw.add(";H25=5                      ;Hopper 5 selected", number=True)
+    bw.add(";H35=20                     ;Channel 5 carrier gas (%) 10% = 1l/min", number=True)
+    bw.add(";H45=0                      ;Channel 5 stirrer speed (%)", number=True)
+    bw.add(";H55=0                      ;Channel 5 turntable speed (%)\n", number=True)
+
+    bw.add(comment="++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+    bw.add(comment="+         /!\\ SELECT WHICH HOPPER(S) TO USE /!\\                                +")
+    bw.add(comment="++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+
+    bw.add(";M160                         ;Hopper 1 ON (turntable + stirrer + gas)")
+    bw.add(";M162                         ;Hopper 2 ON (turntable + stirrer + gas)")
+    bw.add(" M164                          Hopper 3 ON (turntable + stirrer + gas)")
+    bw.add(";M166                         ;Hopper 4 ON (turntable + stirrer + gas)")
+    bw.add(";M168                         ;Hopper 5 ON (turntable + stirrer + gas)")
+
     bw.add("G04 F=10", "Powder stabilization dwell")
 
 def build_toolpath(bw, parsed):
     bw.section("TOOLPATH FROM HP/LST")
-    bw.add(comment="Rules: TC_ACL(2,...) -> M110, TC_ACL(1,...) -> M111")
-    bw.add(comment="G01/G02/G03/CIP copied from source, except PowerUpLen/PowerDownLen ramp moves")
-    bw.add(comment="TC_LMD_POWDER and IsFirstBlock logic ignored in body")
     for item in parsed["toolpath_items"]:
-        if item.get("code") is None:
+        if item.get("blank"):
+            bw.add()
+        elif item.get("code") is None:
             bw.add(comment=item.get("comment", ""))
         else:
             bw.add(item["code"], comment=item.get("comment"), number=item.get("number", True))
@@ -395,15 +528,22 @@ def build_mpf(parsed):
     bw.add(f"{gas['secondary_on']}", "Secondary gas ON")
     build_hopper_block(bw, parsed)
     bw.section("POSITIONING")
+    if parsed.get("source_set_g54"):
+        bw.add(comment=f"Source origin retained for review: {parsed['source_set_g54']}")
     bw.add("G17 G54", "XY plane and work offset")
     bw.add("G90", "Absolute programming")
-    bw.add(f"G01 F=RAPIDFEED X{parsed['start_x']:.3f} Y{parsed['start_y']:.3f}", "Move to detected source start XY")
-    bw.add(f"G01 Z{parsed['start_z']:.3f}", "Move to detected source start Z")
+    bw.add(f"G01 F=RAPIDFEED X={parsed['start_x']:.3f} Y={parsed['start_y']:.3f}", "Move to detected source start XY")
+    bw.add(f"G01 Z={parsed['start_z']:.3f}", "Move to detected source start Z")
     bw.add("M0", "Operator confirmation")
     build_toolpath(bw, parsed)
     bw.section("END PROGRAM")
-    bw.add(f"{laser['fire_off']}", f"Laser OFF (HP method {parsed['laser_off_method']})")
-    bw.add(f"{hopper['off']}", f"Hopper {parsed['hopper']} OFF")
+    bw.add(f"{laser['fire_off']}")
+    bw.add("M161                ;Hopper 1 OFF (turntable + stirrer + gas)")
+    bw.add(";M163                ;Hopper 2 OFF (turntable + stirrer + gas)")
+    bw.add(";M165                ;Hopper 3 OFF (turntable + stirrer + gas)")
+    bw.add(";M167                ;Hopper 4 OFF (turntable + stirrer + gas)")
+    bw.add(";M169                ;Hopper 5 OFF (turntable + stirrer + gas)")
+
     bw.add(f"{gas['secondary_off']}", "Secondary gas OFF")
     bw.add(f"{gas['central_off']}", "Central gas OFF")
     bw.add("M02", "Program end")
