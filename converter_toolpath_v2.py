@@ -277,16 +277,30 @@ def is_label_to_copy(code):
 
 def normalize_equals(code):
     """
-    Normalise motion/address words so X0.201 becomes X=0.201.
-    Existing X=... style is kept unchanged.
+    Normalise Siemens-style axis words so X0.201 becomes X=0.201.
+
+    Important:
+    - I1/J1/K1 must stay as I1/J1/K1.
+    - Do NOT turn I1=40.463 into I=1=40.463.
     """
     c = strip_block_number(code).strip()
-    addresses = ["I1", "J1", "K1", "X", "Y", "Z", "B", "C", "A", "I", "J", "K", "F"]
-    for addr in addresses:
+
+    # Handle numbered interpolation words first.
+    for addr in ["I1", "J1", "K1"]:
         c = re.sub(rf"\b{addr}\s+(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
         c = re.sub(rf"\b{addr}(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
-    return c
 
+    # Single-letter axis words.
+    for addr in ["X", "Y", "Z", "B", "C", "A", "F"]:
+        c = re.sub(rf"\b{addr}\s+(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
+        c = re.sub(rf"\b{addr}(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
+
+    # Single-letter arc words must not match I1/J1/K1.
+    for addr in ["I", "J", "K"]:
+        c = re.sub(rf"\b{addr}(?!\d)\s+(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
+        c = re.sub(rf"\b{addr}(?!\d)(?=[+-]?\d)", f"{addr}=", c, flags=re.I)
+
+    return c
 
 def clean_motion_or_command(code):
     return normalize_equals(code)
@@ -491,9 +505,6 @@ def build_mpf(parsed):
     bw.add(comment="************************************************************")
     bw.add(comment=f" Source file: {parsed['source_name']}")
     bw.add(comment=f" Power head selected: {parsed['power_head'].upper()}")
-    bw.add(comment=f" Toolpath motions copied: {report['copied_motion']}")
-    bw.add(comment=f" Laser ON commands converted: {report['laser_on']}")
-    bw.add(comment=f" Laser OFF commands converted: {report['laser_off']}")
     bw.add()
     bw.section("DEFINITIONS")
     bw.add(f"DEF REAL WELDFEED = {parsed['weldfeed']:.3f}", "Deposition feedrate, mm/min")
@@ -516,6 +527,12 @@ def build_mpf(parsed):
     bw.add(comment="Reference power equation used for PUIS_SET")
     bw.add(comment="***** 10Vx *****" if parsed["power_head"] == "10vx" else "***** 24Vx *****")
     bw.add(comment=f"PUIS_SET = {get_power_formula_comment(parsed['power_head'])}")
+
+    if parsed.get("setup_commands"):
+        bw.section("END OF DECLARATIONS / SOURCE SETUP")
+        for setup_cmd in parsed["setup_commands"]:
+            bw.add(setup_cmd)
+
     bw.section("LASER MODE")
     bw.add(f"{laser['mode']} 1", "Fixed power mode")
     bw.add(f"{laser['power']} PUIS_SET", "Laser power command")
@@ -538,12 +555,7 @@ def build_mpf(parsed):
     build_toolpath(bw, parsed)
     bw.section("END PROGRAM")
     bw.add(f"{laser['fire_off']}")
-    bw.add("M161                ;Hopper 1 OFF (turntable + stirrer + gas)")
-    bw.add(";M163                ;Hopper 2 OFF (turntable + stirrer + gas)")
-    bw.add(";M165                ;Hopper 3 OFF (turntable + stirrer + gas)")
-    bw.add(";M167                ;Hopper 4 OFF (turntable + stirrer + gas)")
-    bw.add(";M169                ;Hopper 5 OFF (turntable + stirrer + gas)")
-
+    bw.add(f"{hopper['off']}", f"Hopper {parsed['hopper']} OFF")
     bw.add(f"{gas['secondary_off']}", "Secondary gas OFF")
     bw.add(f"{gas['central_off']}", "Central gas OFF")
     bw.add("M02", "Program end")
@@ -561,9 +573,19 @@ def convert_hp_to_mpf_text(hp_text: str, source_name: str = "uploaded.HP", power
 
 def get_conversion_report(hp_text: str, source_name: str = "uploaded.HP", power_head="24vx") -> dict:
     parsed = parse_common(hp_text.splitlines(), source_name=Path(source_name).name, power_head=power_head)
-    report = dict(parsed["toolpath_report"])
-    report.update({"layer_count": parsed["layer_count"], "power_head": parsed["power_head"], "puis_laser": parsed["puis_laser"]})
-    return report
+    report = parsed["toolpath_report"]
+
+    # Keep the UI report short. Detailed counters such as copied_motion,
+    # laser_on, laser_off, ignored_power_ramp, ignored_tc_acl_other,
+    # and ignored_logic are intentionally hidden.
+    return {
+        "source_name": parsed["source_name"],
+        "power_head": parsed["power_head"],
+        "layer_count": parsed["layer_count"],
+        "puis_laser": parsed["puis_laser"],
+        "unhandled_count": len(report["unhandled"]),
+        "unhandled": report["unhandled"][:100],
+    }
 
 def convert_hp_to_mpf_file(hp_path: Path, out_path: Path, power_head="24vx"):
     out_path.write_text(build_mpf(parse_hp_program(hp_path, power_head=power_head)), encoding="utf-8")
@@ -585,3 +607,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
