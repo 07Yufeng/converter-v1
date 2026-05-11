@@ -181,6 +181,48 @@ def extract_setup_commands(lines):
                 extracted.append(converted)
     return extracted
 
+
+def extract_origin_section(lines):
+    """
+    Extract the LST origin section:
+      ;-* Origin
+      N10 SET_G54(...)
+      N11 G54
+
+    The section ends when Start positioning/Slicer/BLOCK_START appears.
+    """
+    origin_items = []
+    in_origin = False
+
+    for line in lines:
+        raw = line.strip()
+        code, comment = strip_comment(line)
+        code_clean = strip_block_number(code)
+
+        if raw.startswith(";") and re.search(r"\bOrigin\b", raw, re.I):
+            in_origin = True
+            origin_items.append({"code": None, "comment": raw.lstrip(";").strip()})
+            continue
+
+        if in_origin and raw.startswith(";") and re.search(r"Start positioning|Slicer|BLOCK_START", raw, re.I):
+            break
+
+        if not in_origin:
+            continue
+
+        if not code_clean:
+            continue
+
+        converted = convert_setup_command(code_clean)
+        if converted:
+            origin_items.append({"code": converted, "comment": None})
+            continue
+
+        # Keep only origin-relevant setup lines here. Other lines will be handled
+        # by the normal toolpath parser if needed.
+
+    return origin_items
+
 def is_power_ramp_motion(code):
     return re.search(r"\bPowerUpLen\b|\bPowerDownLen\b", code, re.I) is not None
 
@@ -338,6 +380,7 @@ def parse_toolpath_lines(lines):
     start = find_toolpath_start_index(lines)
     selected_lines = lines[start:] if start is not None else lines
     output = []
+    skip_origin_chunk = False
     report = {"copied_motion": 0, "laser_on": 0, "laser_off": 0, "ignored_power_ramp": 0, "ignored_tc_acl_other": 0, "ignored_logic": 0, "unhandled": []}
     for raw_line in selected_lines:
         code, comment = strip_comment(raw_line)
@@ -367,6 +410,14 @@ def parse_toolpath_lines(lines):
             elif comment and re.search(r"Slicer layer|Origin|Start positioning|Slicer", comment, re.I):
                 output.append({"code": None, "comment": comment.strip()})
             continue
+
+        # Setup commands that appear inside the post-processed toolpath region
+        # should be copied/converted, not reported as unhandled.
+        converted_setup = convert_setup_command(code_clean)
+        if converted_setup:
+            output.append({"code": converted_setup, "comment": None})
+            continue
+
         if is_ignored_logic_line(code_clean):
             report["ignored_logic"] += 1
             continue
@@ -428,6 +479,7 @@ def parse_common(lines, source_name="uploaded.HP", power_head="24vx"):
     parsed["laser_off_method"] = detect_laser_off_method(lines)
     parsed["source_set_g54"] = find_source_set_g54(lines)
     parsed["setup_commands"] = extract_setup_commands(lines)
+    parsed["origin_section"] = extract_origin_section(lines)
     parsed["start_x"], parsed["start_y"], parsed["start_z"] = detect_start_position(lines)
     parsed["puis_laser"] = convert_power_to_puis(parsed["power_w"], parsed["power_head"])
     gas_settings = get_gas_settings(parsed["power_head"])
@@ -544,9 +596,16 @@ def build_mpf(parsed):
     bw.add(f"{gas['central_on']}", "Central gas ON")
     bw.add(f"{gas['secondary_on']}", "Secondary gas ON")
     build_hopper_block(bw, parsed)
+
+    if parsed.get("origin_section"):
+        bw.section("ORIGIN")
+        for item in parsed["origin_section"]:
+            if item.get("code") is None:
+                bw.add(comment=item.get("comment", ""))
+            else:
+                bw.add(item["code"])
+
     bw.section("POSITIONING")
-    if parsed.get("source_set_g54"):
-        bw.add(comment=f"Source origin retained for review: {parsed['source_set_g54']}")
     bw.add("G17 G54", "XY plane and work offset")
     bw.add("G90", "Absolute programming")
     bw.add(f"G01 F=RAPIDFEED X={parsed['start_x']:.3f} Y={parsed['start_y']:.3f}", "Move to detected source start XY")
@@ -607,4 +666,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
