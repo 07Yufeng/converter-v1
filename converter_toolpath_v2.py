@@ -143,6 +143,11 @@ def find_axis_numeric(code, axis):
     return float(m.group(1)) if m else None
 
 def find_toolpath_start_index(lines):
+    """
+    General source start used for detecting start position.
+    This may begin at END_OF_HEADER because the start-positioning move is before
+    the first Slicer layer.
+    """
     for i, line in enumerate(lines):
         if "END_OF_HEADER" in line.upper():
             return i + 1
@@ -156,6 +161,21 @@ def find_toolpath_start_index(lines):
     return None
 
 
+def find_deposition_start_index(lines):
+    """
+    Actual toolpath body starts at the first slicer layer, not at END_OF_HEADER.
+
+    This prevents duplicated output:
+      ORIGIN section -> POSITIONING section -> TOOLPATH containing Origin again.
+    """
+    for i, line in enumerate(lines):
+        if re.search(r"Slicer\s+layer\s+0", line, re.I):
+            return i
+    for i, line in enumerate(lines):
+        code, _ = strip_comment(line)
+        if re.match(r"BLOCK_\d+\s*:", strip_block_number(code), re.I):
+            return i
+    return find_toolpath_start_index(lines)
 
 def find_source_set_g54(lines):
     set_g54_lines = []
@@ -377,7 +397,7 @@ def convert_setup_command(code):
     return None
 
 def parse_toolpath_lines(lines):
-    start = find_toolpath_start_index(lines)
+    start = find_deposition_start_index(lines)
     selected_lines = lines[start:] if start is not None else lines
     output = []
     skip_origin_chunk = False
@@ -580,6 +600,11 @@ def build_mpf(parsed):
     bw.add(comment="***** 10Vx *****" if parsed["power_head"] == "10vx" else "***** 24Vx *****")
     bw.add(comment=f"PUIS_SET = {get_power_formula_comment(parsed['power_head'])}")
 
+    if parsed.get("setup_commands"):
+        bw.section("END OF DECLARATIONS / SOURCE SETUP")
+        for setup_cmd in parsed["setup_commands"]:
+            bw.add(setup_cmd)
+
     bw.section("LASER MODE")
     bw.add(f"{laser['mode']} 1", "Fixed power mode")
     bw.add(f"{laser['power']} PUIS_SET", "Laser power command")
@@ -591,14 +616,13 @@ def build_mpf(parsed):
     bw.add(f"{gas['central_on']}", "Central gas ON")
     bw.add(f"{gas['secondary_on']}", "Secondary gas ON")
     build_hopper_block(bw, parsed)
-
     if parsed.get("setup_commands"):
         bw.section("END OF DECLARATIONS / SOURCE SETUP")
         for setup_cmd in parsed["setup_commands"]:
             bw.add(setup_cmd)
-
+            
     if parsed.get("origin_section"):
-        bw.section("ORIGIN")
+        bw.section("ORIGIN FROM LST")
         for item in parsed["origin_section"]:
             if item.get("code") is None:
                 bw.add(comment=item.get("comment", ""))
