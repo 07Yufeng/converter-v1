@@ -580,11 +580,6 @@ def build_mpf(parsed):
     bw.add(comment="***** 10Vx *****" if parsed["power_head"] == "10vx" else "***** 24Vx *****")
     bw.add(comment=f"PUIS_SET = {get_power_formula_comment(parsed['power_head'])}")
 
-    if parsed.get("setup_commands"):
-        bw.section("END OF DECLARATIONS / SOURCE SETUP")
-        for setup_cmd in parsed["setup_commands"]:
-            bw.add(setup_cmd)
-
     bw.section("LASER MODE")
     bw.add(f"{laser['mode']} 1", "Fixed power mode")
     bw.add(f"{laser['power']} PUIS_SET", "Laser power command")
@@ -596,6 +591,11 @@ def build_mpf(parsed):
     bw.add(f"{gas['central_on']}", "Central gas ON")
     bw.add(f"{gas['secondary_on']}", "Secondary gas ON")
     build_hopper_block(bw, parsed)
+
+    if parsed.get("setup_commands"):
+        bw.section("END OF DECLARATIONS / SOURCE SETUP")
+        for setup_cmd in parsed["setup_commands"]:
+            bw.add(setup_cmd)
 
     if parsed.get("origin_section"):
         bw.section("ORIGIN")
