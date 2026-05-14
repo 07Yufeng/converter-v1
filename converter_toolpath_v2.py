@@ -616,11 +616,7 @@ def build_mpf(parsed):
     bw.add(f"{gas['central_on']}", "Central gas ON")
     bw.add(f"{gas['secondary_on']}", "Secondary gas ON")
     build_hopper_block(bw, parsed)
-    if parsed.get("setup_commands"):
-        bw.section("END OF DECLARATIONS / SOURCE SETUP")
-        for setup_cmd in parsed["setup_commands"]:
-            bw.add(setup_cmd)
-            
+
     if parsed.get("origin_section"):
         bw.section("ORIGIN FROM LST")
         for item in parsed["origin_section"]:
@@ -690,3 +686,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
